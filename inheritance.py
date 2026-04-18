@@ -102,7 +102,9 @@ class Osoba:
                  notatki: str = "",
                  akt_urodzenia: bool = True,
                  akt_malzenstwa: bool = True,
-                 akt_smierci: bool = True):
+                 akt_smierci: bool = True,
+                 podstawa_odrzucenia: str = "",
+                 podstawa_odrzucenia_tekst: str = ""):
         self.id = id or str(uuid.uuid4())[:8]
         self.imie = imie
         self.nazwisko = nazwisko
@@ -119,6 +121,10 @@ class Osoba:
         self.akt_smierci = akt_smierci
         self.zrzekla_sie = zrzekla_sie
         self.zrzeczenie_obejmuje_zstepnych = zrzeczenie_obejmuje_zstepnych
+        # Podstawa odrzucenia: "akta_n" | "oswiadczenie_sadowe" | "akt_notarialny" | "inne_akta" | ""
+        self.podstawa_odrzucenia = podstawa_odrzucenia
+        # Tekst uzupełniający dla "akta_n" i "inne_akta"
+        self.podstawa_odrzucenia_tekst = podstawa_odrzucenia_tekst
 
     @property
     def pelne_imie(self):
@@ -151,6 +157,8 @@ class Osoba:
             "akt_smierci": self.akt_smierci,
             "zrzekla_sie": self.zrzekla_sie,
             "zrzeczenie_obejmuje_zstepnych": self.zrzeczenie_obejmuje_zstepnych,
+            "podstawa_odrzucenia": self.podstawa_odrzucenia,
+            "podstawa_odrzucenia_tekst": self.podstawa_odrzucenia_tekst,
         }
 
     @staticmethod
@@ -161,6 +169,8 @@ class Osoba:
         d.setdefault("akt_smierci", True)
         d.setdefault("zrzekla_sie", False)
         d.setdefault("zrzeczenie_obejmuje_zstepnych", True)
+        d.setdefault("podstawa_odrzucenia", "")
+        d.setdefault("podstawa_odrzucenia_tekst", "")
         # MIGRACJA DANYCH: stare pliki mogły używać wydziedziczona=True
         # jako zrzeczenie — zostaw jak jest, użytkownik powinien ręcznie
         # zmigrować dane (lub można tu dodać logikę migracji)
@@ -195,16 +205,54 @@ class BazaDanych:
                 o.malzonek_id = None
 
     def zapisz(self, plik: str):
+        """Zapis niezaszyfrowany — zachowany dla kompatybilności wstecznej.
+        W nowym kodzie używaj zapisz_zaszyfrowana()."""
         self.plik = plik
         with open(plik, "w", encoding="utf-8") as f:
             json.dump([o.to_dict() for o in self.osoby.values()], f,
                       ensure_ascii=False, indent=2)
 
     def wczytaj(self, plik: str):
+        """Odczyt niezaszyfrowany — zachowany dla kompatybilności wstecznej.
+        W nowym kodzie używaj wczytaj_zaszyfrowana()."""
         self.plik = plik
         with open(plik, "r", encoding="utf-8") as f:
             data = json.load(f)
         self.osoby = {d["id"]: Osoba.from_dict(d) for d in data}
+
+    # ── F-02: metody szyfrujące (RODO art. 25, 32(1)(a)) ─────────────────────
+
+    def zapisz_zaszyfrowana(self, plik: str, haslo: str) -> None:
+        """
+        Serializuje bazę do JSON, szyfruje AES-256-GCM i zapisuje do pliku .kpj.
+
+        Parametry:
+            plik  — ścieżka docelowa (zalecane rozszerzenie .kpj)
+            haslo — hasło podane przez użytkownika; używane do wyprowadzenia klucza
+                    metodą PBKDF2-SHA256 (480 000 iteracji, 128-bitowa sól losowa)
+
+        Rzuca:
+            ImportError — gdy biblioteka cryptography nie jest zainstalowana
+            OSError     — przy błędzie zapisu pliku
+        """
+        from crypto_helper import zapisz_zaszyfrowany
+        self.plik = plik
+        dane = [o.to_dict() for o in self.osoby.values()]
+        zapisz_zaszyfrowany(plik, dane, haslo)
+
+    def wczytaj_zaszyfrowana(self, plik: str, haslo: str) -> None:
+        """
+        Odczytuje plik .kpj, odszyfrowuje i ładuje osoby do bazy.
+
+        Rzuca:
+            ImportError — gdy biblioteka cryptography nie jest zainstalowana
+            ValueError  — przy złym haśle lub uszkodzonym pliku
+            OSError     — przy błędzie odczytu pliku
+        """
+        from crypto_helper import wczytaj_zaszyfrowany
+        self.plik = plik
+        dane = wczytaj_zaszyfrowany(plik, haslo)
+        self.osoby = {d["id"]: Osoba.from_dict(d) for d in dane}
 
     def dzieci(self, id: str) -> list:
         return [o for o in self.osoby.values() if id in o.rodzic_ids]
@@ -244,6 +292,67 @@ class BazaDanych:
             wynik.extend(self.rodzenstwo(rodzic.id))
         return wynik
 
+    def _przodkowie(self, oid: str) -> set:
+        """Zwraca zbiór ID wszystkich przodków (rodzice, dziadkowie itd.) metodą BFS."""
+        wynik = set()
+        kolejka = list(self.rodzice(oid))
+        while kolejka:
+            p = kolejka.pop()
+            if p.id in wynik:
+                continue
+            wynik.add(p.id)
+            kolejka.extend(self.rodzice(p.id))
+        return wynik
+
+    def sprawdz_niedozwolony_zwiazek(self, osoba_id, kandydat_id,
+                                      extra_rodzice_osoby=None) -> str:
+        """
+        Sprawdza dopuszczalność prawną małżeństwa (KRiO art. 14 §1).
+
+        Parametry:
+            osoba_id             — ID osoby edytowanej (None gdy dodawana nowa)
+            kandydat_id          — ID proponowanego małżonka
+            extra_rodzice_osoby  — lista ID rodziców nowej osoby (gdy osoba_id=None)
+
+        Zwraca:
+            Pusty string gdy związek jest dozwolony.
+            Komunikat błędu gdy niedozwolony.
+        """
+        if not kandydat_id:
+            return ""
+        if osoba_id and osoba_id == kandydat_id:
+            return "Osoba nie może być własnym małżonkiem (KRiO art. 10 §1)."
+
+        # Zbuduj zbiór przodków osoby i jej rodziców
+        if osoba_id and osoba_id in self.osoby:
+            rodzice_osoby_ids = {p.id for p in self.rodzice(osoba_id)}
+            przodkowie_osoby = self._przodkowie(osoba_id)
+        else:
+            rodzice_osoby_ids = set(extra_rodzice_osoby or [])
+            przodkowie_osoby = set(rodzice_osoby_ids)
+            for pid in rodzice_osoby_ids:
+                przodkowie_osoby |= self._przodkowie(pid)
+
+        przodkowie_kandydata = self._przodkowie(kandydat_id)
+
+        # Krewny w linii prostej wstępnej (kandydat jest przodkiem osoby)
+        if kandydat_id in przodkowie_osoby:
+            return ("Niedozwolone małżeństwo z krewnym w linii prostej (przodek). "
+                    "KRiO art. 14 §1.")
+
+        # Krewny w linii prostej zstępnej (osoba jest przodkiem kandydata)
+        if osoba_id and osoba_id in przodkowie_kandydata:
+            return ("Niedozwolone małżeństwo z krewnym w linii prostej (zstępny). "
+                    "KRiO art. 14 §1.")
+
+        # Rodzeństwo — w tym przyrodnie (wspólny co najmniej jeden rodzic)
+        rodzice_kandydata_ids = {p.id for p in self.rodzice(kandydat_id)}
+        if rodzice_osoby_ids & rodzice_kandydata_ids:
+            return ("Niedozwolone małżeństwo między rodzeństwem lub przyrodnim "
+                    "rodzeństwem. KRiO art. 14 §1.")
+
+        return ""
+
 
 # ── Silnik dziedziczenia (KC art. 931–940) ────────────────────────────────────
 class SilnikDziedziczenia:
@@ -253,25 +362,25 @@ class SilnikDziedziczenia:
         self.sp = baza.osoby.get(spadkodawca_id)
 
     def _efektywny(self, osoba_id: str) -> bool:
-            """
-            Zwraca True jeśli osoba dziedziczy ustawowo.
+        """
+        Zwraca True jeśli osoba dziedziczy ustawowo.
 
-            WYŁĄCZENIA z dziedziczenia ustawowego:
-            - zrzeczenie się dziedziczenia (art. 1048 KC)
-            - odrzucenie spadku (art. 1020 KC)
+        WYŁĄCZENIA z dziedziczenia ustawowego:
+        - zrzeczenie się dziedziczenia (art. 1048 KC)
+        - odrzucenie spadku (art. 1020 KC)
 
-            NIE wyłącza: wydziedziczenie z art. 1008 KC — to jedynie
-            pozbawia prawa do zachowku, nie wpływa na dziedziczenie ustawowe.
-            """
-            o = self.baza.osoby.get(osoba_id)
-            if not o:
-                return False
-            if o.zrzekla_sie:        # art. 1048 KC — wyłączona z dziedziczenia
-                return False
-            if o.odrzucila_spadek:   # art. 1020 KC — traktowana jak nieżyjąca
-                return False
-            # o.wydziedziczona (art. 1008 KC) NIE wpływa na dziedziczenie ustawowe
-            return True
+        NIE wyłącza: wydziedziczenie z art. 1008 KC — to jedynie
+        pozbawia prawa do zachowku, nie wpływa na dziedziczenie ustawowe.
+        """
+        o = self.baza.osoby.get(osoba_id)
+        if not o:
+            return False
+        if o.zrzekla_sie:        # art. 1048 KC — wyłączona z dziedziczenia
+            return False
+        if o.odrzucila_spadek:   # art. 1020 KC — traktowana jak nieżyjąca
+            return False
+        # o.wydziedziczona (art. 1008 KC) NIE wpływa na dziedziczenie ustawowe
+        return True
 
     def oblicz(self) -> dict:
         if not self.sp:
@@ -311,27 +420,77 @@ class SilnikDziedziczenia:
         return udzialy
 
     def _zstepni_efektywni(self, id: str) -> list:
-            """
-            Szuka efektywnych zstępnych osoby która nie może/nie chce dziedziczyć.
+        """
+        Szuka efektywnych zstępnych osoby która nie może/nie chce dziedziczyć.
 
-            Rozróżnienie:
-            - odrzucenie spadku (art. 1020): zstępni WCHODZĄ w miejsce odrzucającego
-            - zrzeczenie się (art. 1048 + 1049 §1): zstępni domyślnie TEŻ wyłączeni,
-              chyba że umowa stanowi inaczej (zrzeczenie_obejmuje_zstepnych=False)
-            """
-            o = self.baza.osoby.get(id)
-            wynik = []
-            for d in self.baza.dzieci(id):
-                # Jeśli rodzic zrzekł się i zrzeczenie obejmuje zstępnych —
-                # zstępni są wyłączeni (art. 1049 §1 KC), nie szukamy dalej
-                if o and o.zrzekla_sie and o.zrzeczenie_obejmuje_zstepnych:
-                    continue  # pomiń całą gałąź
+        Rozróżnienie:
+        - odrzucenie spadku (art. 1020): zstępni WCHODZĄ w miejsce odrzucającego
+        - zrzeczenie się (art. 1048 + 1049 §1): zstępni domyślnie TEŻ wyłączeni,
+          chyba że umowa stanowi inaczej (zrzeczenie_obejmuje_zstepnych=False)
+        """
+        o = self.baza.osoby.get(id)
+        wynik = []
+        for d in self.baza.dzieci(id):
+            # Jeśli rodzic zrzekł się i zrzeczenie obejmuje zstępnych —
+            # zstępni są wyłączeni (art. 1049 §1 KC), nie szukamy dalej
+            if o and o.zrzekla_sie and o.zrzeczenie_obejmuje_zstepnych:
+                continue  # pomiń całą gałąź
 
-                if d.zyje and self._efektywny(d.id):
-                    wynik.append(d.id)
-                else:
-                    wynik.extend(self._zstepni_efektywni(d.id))
-            return wynik
+            if d.zyje and self._efektywny(d.id):
+                wynik.append(d.id)
+            else:
+                wynik.extend(self._zstepni_efektywni(d.id))
+        return wynik
+
+    def _udzialy_zstepnych(self, id: str) -> dict:
+        """
+        Zwraca udziały reprezentantów danej osoby według zasad reprezentacji.
+
+        Każde dziecko tworzy osobną gałąź; jeżeli nie może dziedziczyć, w jego
+        miejsce wchodzą jego zstępni, dzieląc udział tej gałęzi dalej
+        rekurencyjnie.
+        """
+        o = self.baza.osoby.get(id)
+        if o and o.zrzekla_sie and o.zrzeczenie_obejmuje_zstepnych:
+            return {}
+
+        galezie = []
+        for d in self.baza.dzieci(id):
+            if d.id == self.sp_id:
+                continue
+            if d.zyje and self._efektywny(d.id):
+                galezie.append({d.id: Fraction(1)})
+            else:
+                udzialy = self._udzialy_zstepnych(d.id)
+                if udzialy:
+                    galezie.append(udzialy)
+
+        if not galezie:
+            return {}
+
+        wynik = {}
+        czesc_na_galaz = Fraction(1, len(galezie))
+        for galaz in galezie:
+            for oid, udzial in galaz.items():
+                wynik[oid] = wynik.get(oid, Fraction(0)) + udzial * czesc_na_galaz
+        return wynik
+
+    def _pasierb_uprawniony(self, osoba) -> bool:
+        """
+        Art. 934(1) KC: pasierb dziedziczy tylko wtedy, gdy nie dożył otwarcia
+        spadku żaden z jego rodziców poza spadkodawcą.
+        """
+        if not osoba or not osoba.zyje or not self._efektywny(osoba.id):
+            return False
+        if self.sp_id in osoba.rodzic_ids:
+            return False
+
+        inni_rodzice = [rid for rid in osoba.rodzic_ids if rid != self.sp_id]
+        for rid in inni_rodzice:
+            rodzic = self.baza.osoby.get(rid)
+            if rodzic and rodzic.zyje:
+                return False
+        return True
 
     def _group_II(self) -> dict:
         malzonek = self.baza.malzonek(self.sp_id)
@@ -391,23 +550,39 @@ class SilnikDziedziczenia:
 
     def _group_III(self) -> dict:
         dziadkowie = self.baza.dziadkowie(self.sp_id)
-        efekt = [d for d in dziadkowie if self._efektywny(d.id) and d.zyje]
-        if not efekt:
+        if not dziadkowie:
             wuj = [w for w in self.baza.wujkowie_ciotki(self.sp_id)
                    if self._efektywny(w.id) and w.zyje]
             if wuj:
                 c = Fraction(1, len(wuj))
                 return {w.id: c for w in wuj}
             return self._group_IV()
-        c = Fraction(1, len(efekt))
-        return {d.id: c for d in efekt}
+
+        galezie = []
+        for dziadek in dziadkowie:
+            if dziadek.zyje and self._efektywny(dziadek.id):
+                galezie.append({dziadek.id: Fraction(1)})
+                continue
+
+            udzialy_zstepnych = self._udzialy_zstepnych(dziadek.id)
+            if udzialy_zstepnych:
+                galezie.append(udzialy_zstepnych)
+
+        if not galezie:
+            return self._group_IV()
+
+        wynik = {}
+        czesc_na_galaz = Fraction(1, len(galezie))
+        for galaz in galezie:
+            for oid, udzial in galaz.items():
+                wynik[oid] = wynik.get(oid, Fraction(0)) + udzial * czesc_na_galaz
+        return wynik
 
     def _group_IV(self) -> dict:
         malzonek = self.baza.malzonek(self.sp_id)
         if malzonek:
             pasierbowie = [d for d in self.baza.dzieci(malzonek.id)
-                           if self.sp_id not in d.rodzic_ids
-                           and self._efektywny(d.id) and d.zyje]
+                           if self._pasierb_uprawniony(d)]
             if pasierbowie:
                 c = Fraction(1, len(pasierbowie))
                 return {p.id: c for p in pasierbowie}
@@ -533,6 +708,10 @@ def _generuj_pdf_spadki(baza: BazaDanych, spadkodawca_id: str, plik: str):
         for o in baza.rodzice(oid):
             if not o.zyje:
                 osoby_w_raporcie.add(o.id)
+    # Dodaj osoby, które odrzuciły spadek — też wymagają dokumentów
+    for o in baza.osoby.values():
+        if o.odrzucila_spadek:
+            osoby_w_raporcie.add(o.id)
 
     osoby_do_docs = sorted([baza.osoby[o] for o in osoby_w_raporcie if o in baza.osoby],
                            key=lambda x: x.nazwisko)
@@ -575,6 +754,40 @@ def _generuj_pdf_spadki(baza: BazaDanych, spadkodawca_id: str, plik: str):
         for imie_b, typ_b, uzas_b in braki:
             elements.append(Paragraph(f"⚠  {imie_b} — brak: {typ_b}  ({uzas_b})", alert_s))
 
+    # ── Podstawy odrzucenia spadku ─────────────────────────────────────────────
+    _PODSTAWY_ETYKIETY = {
+        "akta_n":             "Akta N",
+        "oswiadczenie_sadowe": "Oświadczenie w toku postępowania sądowego",
+        "akt_notarialny":      "Akt notarialny w aktach",
+        "inne_akta":           "Inne akta",
+    }
+    odrzucajacy = [o for o in baza.osoby.values() if o.odrzucila_spadek]
+    if odrzucajacy:
+        elements.append(Spacer(1, 12))
+        elements.append(Paragraph("PODSTAWY ODRZUCENIA SPADKU", sekcja_s))
+        odrz_data = [["Osoba", "Podstawa odrzucenia", "Sygnatura / opis"]]
+        for o in sorted(odrzucajacy, key=lambda x: x.nazwisko):
+            etykieta = _PODSTAWY_ETYKIETY.get(o.podstawa_odrzucenia, "")
+            if not etykieta:
+                etykieta = "⚠ nie wskazano podstawy"
+            tekst = o.podstawa_odrzucenia_tekst or ""
+            if o.podstawa_odrzucenia in ("akta_n", "inne_akta") and not tekst:
+                tekst = "⚠ brak opisu (pole tekstowe niewypełnione)"
+            odrz_data.append([o.pelne_imie, etykieta, tekst])
+        to = Table(odrz_data, colWidths=[5*cm, 6*cm, 5*cm])
+        to.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#5a3e8a")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), PDF_BOLD), ("FONTNAME", (0, 1), (-1, -1), PDF_REG),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#f3eeff"), colors.white]),
+            ("GRID", (0, 0), (-1, -1), 0.3, colors.lightgrey),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8), ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
+        elements.append(to)
+
     note_s = ParagraphStyle("note", fontSize=8, fontName=PDF_REG, textColor=colors.grey,
                              spaceAfter=4, leading=12)
     elements.append(Spacer(1, 20))
@@ -599,12 +812,15 @@ class DrzewoGenealogiczne(tk.Frame):
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<ButtonPress-1>", self._start_pan)
         self.canvas.bind("<B1-Motion>", self._pan)
+        self.canvas.bind("<ButtonRelease-1>", self._stop_drag)
         self.canvas.bind("<MouseWheel>", self._zoom)
         self.canvas.bind("<Button-4>", self._zoom)
         self.canvas.bind("<Button-5>", self._zoom)
         self.canvas.bind("<Double-Button-1>", self._dwuklik)
         self.canvas.bind("<ButtonPress-3>", self._kontekst)
         self._pan_start = None
+        self._drag_osoba_id = None
+        self._custom_offsets = {}   # {oid: (dx, dy)} w jednostkach bez skali
         self._scale = 1.0
         self._offset = [50, 50]
         self.positions = {}
@@ -613,26 +829,43 @@ class DrzewoGenealogiczne(tk.Frame):
         self.on_delete = None
 
     def _get_osoba_at(self, x, y):
-        item = self.canvas.find_closest(x, y)
-        if not item:
-            return None
-        for t in self.canvas.gettags(item[0]):
-            if t.startswith("os_"):
-                return t[3:]
+        items = self.canvas.find_overlapping(x - 1, y - 1, x + 1, y + 1)
+        for item in reversed(items):
+            for t in self.canvas.gettags(item):
+                if t.startswith("os_"):
+                    return t[3:]
         return None
 
     def _start_pan(self, e):
         self._pan_start = (e.x, e.y)
         oid = self._get_osoba_at(e.x, e.y)
-        if oid and self.on_select:
-            self.on_select(oid)
+        if oid:
+            self._drag_osoba_id = oid
+            if self.on_select:
+                self.on_select(oid)
+        else:
+            self._drag_osoba_id = None
 
     def _pan(self, e):
-        if self._pan_start:
-            self._offset[0] += e.x - self._pan_start[0]
-            self._offset[1] += e.y - self._pan_start[1]
-            self._pan_start = (e.x, e.y)
-            self.odrysuj()
+        if not self._pan_start:
+            return
+        dx = e.x - self._pan_start[0]
+        dy = e.y - self._pan_start[1]
+        self._pan_start = (e.x, e.y)
+        if self._drag_osoba_id:
+            prev = self._custom_offsets.get(self._drag_osoba_id, (0.0, 0.0))
+            self._custom_offsets[self._drag_osoba_id] = (
+                prev[0] + dx / self._scale,
+                prev[1] + dy / self._scale,
+            )
+        else:
+            self._offset[0] += dx
+            self._offset[1] += dy
+        self.odrysuj()
+
+    def _stop_drag(self, e):
+        self._drag_osoba_id = None
+        self._pan_start = None
 
     def _zoom(self, e):
         f = 1.1 if (getattr(e, "delta", 0) > 0 or e.num == 4) else 0.9
@@ -661,6 +894,13 @@ class DrzewoGenealogiczne(tk.Frame):
             menu.tk_popup(e.x_root, e.y_root)
         finally:
             menu.grab_release()
+
+    def reset_pozycji(self):
+        """Czyści ręczne przesunięcia i resetuje widok do układu automatycznego."""
+        self._custom_offsets.clear()
+        self._scale = 1.0
+        self._offset = [50, 50]
+        self.odrysuj()
 
     def centruj_na(self, osoba_id: str):
         self._oblicz_pozycje()
@@ -770,47 +1010,191 @@ class DrzewoGenealogiczne(tk.Frame):
                     sloty.append([oid])
                     odwiedzone.add(oid)
 
-            # Posortuj sloty: grupuj wg klucza rodzicielskiego pierwszej osoby w slocie
-            sloty.sort(key=lambda s: (_klucz_rodzicielski(s[0]), s[0]))
+            # Posortuj sloty wg średniego X rodziców (już obliczonego w poprzednim
+            # pokoleniu). Gwarantuje, że dzieci trafiają pod właściwych rodziców,
+            # niezależnie od przypadkowych wartości UUID.
+            # Slot może zaczynać się od małżonka bez rodziców w bazie (s[0]),
+            # dlatego przeszukujemy rodziców WSZYSTKICH członków slotu.
+            def _klucz_slotu(s):
+                xs = []
+                for mid in s:
+                    o = osoby.get(mid)
+                    for r in (o.rodzic_ids if o else []):
+                        if r in self.positions:
+                            xs.append(self.positions[r][0])
+                if xs:
+                    # Dzieci z rodzicami na pozycjach — sortuj wg ich środka X
+                    return (0, sum(xs) / len(xs), s[0])
+                # Fallback: brak znanych pozycji rodziców (pokolenie 0)
+                return (1, 0.0, s[0])
+
+            sloty.sort(key=_klucz_slotu)
             return sloty
 
-        # ── Krok 3: przypisz współrzędne ──────────────────────────────────────
+        # ── Krok 3: przypisz współrzędne (bottom-up szerokość → top-down pozycje) ─
         bw = self.BOX_W * self._scale
         bh = self.BOX_H * self._scale
         hg = self.H_GAP * self._scale
-        # Mniejszy odstęp wewnątrz pary małżeńskiej, większy między parami/rodzinami
-        para_gap = max(4, 8 * self._scale)   # odstęp między małżonkami
-        rodzina_gap = hg                      # odstęp między różnymi rodzinami/osobami
+        para_gap = max(4, 8 * self._scale)
+        rodzina_gap = hg
         vg = self.V_GAP * self._scale
         cw = max(self.canvas.winfo_width(), 800)
         cx = self._offset[0] + cw / 2
 
         self.positions = {}
 
+        # ── 3a: Buduj sloty dla każdego pokolenia ─────────────────────────────
+        all_gen_sloty = {}   # gen -> [(oid, ...), ...]
+        oid_to_gi    = {}    # oid -> (gen, slot_idx)
+
         for gen in sorted(pokolenia.keys()):
-            sloty = _posortuj_pokolenie(pokolenia[gen])
-
-            # Oblicz łączną szerokość wiersza
-            total_w = 0.0
-            for i, slot in enumerate(sloty):
-                if len(slot) == 2:
-                    total_w += 2 * bw + para_gap
+            ids = set(pokolenia[gen])
+            odw = set()
+            sorted_ids = sorted(ids, key=lambda o: (_klucz_rodzicielski(o), o))
+            sloty = []
+            for oid in sorted_ids:
+                if oid in odw:
+                    continue
+                o = osoby.get(oid)
+                m = o.malzonek_id if o else None
+                if (m and m in ids and m not in odw
+                        and glebokosc.get(m) == gen):
+                    sloty.append((oid, m))
+                    odw.add(oid); odw.add(m)
                 else:
-                    total_w += bw
-                if i < len(sloty) - 1:
-                    total_w += rodzina_gap
+                    sloty.append((oid,))
+                    odw.add(oid)
+            all_gen_sloty[gen] = sloty
+            for idx, slot in enumerate(sloty):
+                for oid in slot:
+                    oid_to_gi[oid] = (gen, idx)
 
+        # ── 3b: Posortuj każde pokolenie wg kolejności rodzicielskich slotów ──
+        for gen in sorted(all_gen_sloty.keys()):
+            if gen == 0:
+                continue
+            sloty = all_gen_sloty[gen]
+
+            def _pkey(idx, _s=sloty, _g=gen):
+                pidxs = []
+                for oid in _s[idx]:
+                    o = osoby.get(oid)
+                    for pid in (o.rodzic_ids if o else []):
+                        if pid in oid_to_gi and oid_to_gi[pid][0] < _g:
+                            pidxs.append(oid_to_gi[pid])
+                return (tuple(sorted(set(pidxs))), idx)
+
+            order = sorted(range(len(sloty)), key=_pkey)
+            all_gen_sloty[gen] = [sloty[i] for i in order]
+            for new_idx, slot in enumerate(all_gen_sloty[gen]):
+                for oid in slot:
+                    oid_to_gi[oid] = (gen, new_idx)
+
+        # ── 3c: Oblicz footprint każdego slotu (bottom-up) ────────────────────
+        # footprint(slot) = max(własna szerokość, suma footprintów bezpośrednich dzieci)
+        fp = {}   # (gen, idx) -> required width
+
+        min_gen = min(all_gen_sloty.keys())
+        max_gen = max(all_gen_sloty.keys())
+
+        for gen in range(max_gen, min_gen - 1, -1):
+            for idx, slot in enumerate(all_gen_sloty[gen]):
+                sw = (2 * bw + para_gap) if len(slot) == 2 else bw
+                slot_ids = set(slot)
+                if gen + 1 in all_gen_sloty:
+                    # Zbierz UNIKALNE indeksy slotów dzieci w gen+1
+                    child_idxs = sorted({
+                        oid_to_gi[o.id][1]
+                        for o in osoby.values()
+                        if o.id in oid_to_gi
+                        and oid_to_gi[o.id][0] == gen + 1
+                        and any(p in slot_ids for p in o.rodzic_ids)
+                    })
+                    if child_idxs:
+                        child_w = (sum(fp[(gen + 1, ci)] for ci in child_idxs)
+                                   + (len(child_idxs) - 1) * rodzina_gap)
+                        fp[(gen, idx)] = max(sw, child_w)
+                    else:
+                        fp[(gen, idx)] = sw
+                else:
+                    fp[(gen, idx)] = sw
+
+        # ── 3d: Przypisz pozycje top-down ──────────────────────────────────────
+        slot_cx = {}   # (gen, idx) -> center X canvasu
+
+        for gen in sorted(all_gen_sloty.keys()):
+            sloty = all_gen_sloty[gen]
             y = self._offset[1] + gen * (bh + vg)
-            x = cx - total_w / 2
 
-            for slot in sloty:
+            if gen == min_gen:
+                # Pokolenie korzeniowe — wyśrodkuj wokół cx
+                total_w = (sum(fp[(gen, i)] for i in range(len(sloty)))
+                           + max(len(sloty) - 1, 0) * rodzina_gap)
+                x = cx - total_w / 2
+                for idx in range(len(sloty)):
+                    slot_cx[(gen, idx)] = x + fp[(gen, idx)] / 2
+                    x += fp[(gen, idx)] + rodzina_gap
+            else:
+                # Grupuj sloty wg klucza rodzicielskiego (slotów rodziców w gen-1)
+                def _pslot_key(idx, _s=sloty, _g=gen):
+                    pidxs = set()
+                    for oid in _s[idx]:
+                        o = osoby.get(oid)
+                        for pid in (o.rodzic_ids if o else []):
+                            if pid in oid_to_gi and oid_to_gi[pid][0] == _g - 1:
+                                pidxs.add(oid_to_gi[pid][1])
+                    return tuple(sorted(pidxs))
+
+                groups = {}
+                for idx in range(len(sloty)):
+                    key = _pslot_key(idx)
+                    groups.setdefault(key, []).append(idx)
+
+                def _gcenter(key):
+                    if not key:
+                        return cx
+                    return sum(slot_cx[(gen - 1, pi)] for pi in key) / len(key)
+
+                # Posortuj grupy wg centrum rodzica (lewe → prawe)
+                group_order = sorted(groups.keys(),
+                                     key=lambda k: (_gcenter(k), k))
+
+                # Wyznacz lewy brzeg grup, rozwiązując kolizje w prawo
+                group_left = {}
+                prev_right = None
+                for key in group_order:
+                    idxs = groups[key]
+                    gw = (sum(fp[(gen, i)] for i in idxs)
+                          + max(len(idxs) - 1, 0) * rodzina_gap)
+                    ideal_left = _gcenter(key) - gw / 2
+                    if prev_right is not None:
+                        ideal_left = max(ideal_left, prev_right + rodzina_gap)
+                    group_left[key] = ideal_left
+                    prev_right = ideal_left + gw
+
+                # Przypisz centra slotów
+                for key in group_order:
+                    x = group_left[key]
+                    for idx in groups[key]:
+                        slot_cx[(gen, idx)] = x + fp[(gen, idx)] / 2
+                        x += fp[(gen, idx)] + rodzina_gap
+
+            # Wyznacz pozycje pudełek z centrum slotu
+            for idx, slot in enumerate(sloty):
+                c  = slot_cx.get((gen, idx), cx)
+                sw = (2 * bw + para_gap) if len(slot) == 2 else bw
+                x  = c - sw / 2
                 if len(slot) == 2:
                     self.positions[slot[0]] = (x, y)
                     self.positions[slot[1]] = (x + bw + para_gap, y)
-                    x += 2 * bw + para_gap + rodzina_gap
                 else:
                     self.positions[slot[0]] = (x, y)
-                    x += bw + rodzina_gap
+
+        # Zastosuj ręczne przesunięcia (drag & drop) — przeliczone przez aktualną skalę
+        for oid, (odx, ody) in self._custom_offsets.items():
+            if oid in self.positions:
+                px, py = self.positions[oid]
+                self.positions[oid] = (px + odx * self._scale, py + ody * self._scale)
 
     def _rysuj_polaczenia(self):
         bw = self.BOX_W * self._scale
@@ -933,6 +1317,27 @@ class DrzewoGenealogiczne(tk.Frame):
                 cxc = xc + bw / 2
                 self.canvas.create_line(cxc, belt_y, cxc, yc,
                                         fill="#7a9fd4", width=1.8, dash=(6, 3))
+
+        # ── Linie rodzeństwa (zielone, przerywane) ────────────────────────────
+        # Grupuj osoby wg frozenset rodziców — każda grupa to rodzeństwo
+        grupy_rod = {}
+        for o in self.baza.osoby.values():
+            if o.id not in self.positions or not o.rodzic_ids:
+                continue
+            klucz = frozenset(o.rodzic_ids)
+            grupy_rod.setdefault(klucz, []).append(o.id)
+
+        for rodzenstwo in grupy_rod.values():
+            widoczni = [oid for oid in rodzenstwo if oid in self.positions]
+            if len(widoczni) < 2:
+                continue
+            widoczni.sort(key=lambda oid: self.positions[oid][0])
+            mid_y = self.positions[widoczni[0]][1] + bh / 2
+            x_lewy  = self.positions[widoczni[0]][0] + bw
+            x_prawy = self.positions[widoczni[-1]][0]
+            self.canvas.create_line(x_lewy, mid_y, x_prawy, mid_y,
+                                    fill="#2e8b57", width=max(1, 1.2 * self._scale),
+                                    dash=(5, 4))
 
     def _rysuj_osoby(self):
         bw = self.BOX_W * self._scale
@@ -1082,13 +1487,52 @@ class DialogOsoby(tk.Toplevel):
         tk.Radiobutton(pf, text="Kobieta", variable=self.v_plec, value="K",
                        bg=PANEL, font=self.f["body"]).pack(side="left", padx=(12, 0))
 
-        self._sep(f, 6, "Rodzice  (z listy lub: Imię Nazwisko → auto-dodanie)")
-        self._lbl(f, "Rodzic 1:", 7)
-        self.cb_r1 = ttk.Combobox(f, values=self._choices(), font=self.f["body"], width=30)
-        self.cb_r1.grid(row=7, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=2, ipady=2)
-        self._lbl(f, "Rodzic 2:", 8)
-        self.cb_r2 = ttk.Combobox(f, values=self._choices(), font=self.f["body"], width=30)
-        self.cb_r2.grid(row=8, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=2, ipady=2)
+        self._sep(f, 6, "Rodzice  (wybierz z listy lub wpisz Imię Nazwisko, potem Dodaj)")
+        r_frame = tk.Frame(f, bg=PANEL)
+        r_frame.grid(row=7, column=0, columnspan=3, sticky="ew", padx=4, pady=(0, 4))
+
+        r_top = tk.Frame(r_frame, bg=PANEL)
+        r_top.pack(fill="x", pady=(0, 2))
+        self.cb_r_input = ttk.Combobox(r_top, values=self._choices(), font=self.f["body"], width=34)
+        self.cb_r_input.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        def _dodaj_rodzica():
+            val = self.cb_r_input.get().strip()
+            if not val:
+                return
+            current = list(self.lb_rodzice.get(0, "end"))
+            if len(current) >= 2:
+                messagebox.showwarning("Limit", "Można dodać maksymalnie 2 rodziców.", parent=self)
+                return
+            if val in current:
+                self.cb_r_input.set("")
+                return
+            self.lb_rodzice.insert("end", val)
+            self.cb_r_input.set("")
+
+        tk.Button(r_top, text="+ Dodaj", command=_dodaj_rodzica,
+                  bg=GOLD_LT, fg=TEXT, font=self.f["small"], relief="flat",
+                  padx=8, pady=3, cursor="hand2").pack(side="left")
+
+        r_bot = tk.Frame(r_frame, bg=PANEL)
+        r_bot.pack(fill="x")
+        self.lb_rodzice = tk.Listbox(r_bot, font=self.f["body"], bg=CREAM, fg=TEXT,
+                                     relief="flat", highlightthickness=1,
+                                     highlightbackground=BORDER, height=2,
+                                     exportselection=False, selectmode="single")
+        r_vsb = ttk.Scrollbar(r_bot, orient="vertical", command=self.lb_rodzice.yview)
+        self.lb_rodzice.configure(yscrollcommand=r_vsb.set)
+        r_vsb.pack(side="right", fill="y")
+        self.lb_rodzice.pack(side="left", fill="both", expand=True)
+
+        def _usun_rodzica():
+            sel = self.lb_rodzice.curselection()
+            if sel:
+                self.lb_rodzice.delete(sel[0])
+
+        tk.Button(r_frame, text="✖ Usuń zaznaczonego", command=_usun_rodzica,
+                  bg="#e0e0e0", fg=TEXT, font=self.f["small"], relief="flat",
+                  padx=6, pady=2, cursor="hand2").pack(anchor="e", pady=(2, 0))
 
         self._sep(f, 9, "Rodzeństwo")
         tk.Label(f,
@@ -1106,7 +1550,7 @@ class DialogOsoby(tk.Toplevel):
 
         self.e_rodz_input = ttk.Combobox(
             rod_top, font=self.f["body"],
-            values=[""] + [o.pelne_imie for o in
+            values=[""] + [f"{o.pelne_imie} [{o.id}]" for o in
                            sorted(self.baza.osoby.values(), key=lambda x: x.nazwisko)
                            if not (self.osoba and o.id == self.osoba.id)])
         self.e_rodz_input.pack(side="left", fill="x", expand=True, padx=(0, 4))
@@ -1161,7 +1605,7 @@ class DialogOsoby(tk.Toplevel):
         dz_top.pack(fill="x", pady=(0, 2))
         self.e_dzieci_input = ttk.Combobox(
             dz_top, font=self.f["body"],
-            values=[""] + [o.pelne_imie for o in
+            values=[""] + [f"{o.pelne_imie} [{o.id}]" for o in
                            sorted(self.baza.osoby.values(), key=lambda x: x.nazwisko)
                            if not (self.osoba and o.id == self.osoba.id)])
         self.e_dzieci_input.pack(side="left", fill="x", expand=True, padx=(0, 4))
@@ -1199,10 +1643,43 @@ class DialogOsoby(tk.Toplevel):
                   padx=6, pady=2, cursor="hand2").pack(anchor="e", pady=(2, 0))
 
         # ── Małżonek / Małżonka (row 15–16) ──────────────────────────────────
-        self._sep(f, 15, "Małżonek / Małżonka")
-        self._lbl(f, "Małżonek/a:", 16)
-        self.cb_m = ttk.Combobox(f, values=self._choices(), font=self.f["body"], width=30)
-        self.cb_m.grid(row=16, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=2, ipady=2)
+        self._sep(f, 15, "Małżonek / Małżonka  (wybierz z listy lub wpisz, potem Ustaw)")
+        m_frame = tk.Frame(f, bg=PANEL)
+        m_frame.grid(row=16, column=0, columnspan=3, sticky="ew", padx=4, pady=(0, 4))
+
+        m_top = tk.Frame(m_frame, bg=PANEL)
+        m_top.pack(fill="x", pady=(0, 2))
+        self.cb_m_input = ttk.Combobox(m_top, values=self._choices(), font=self.f["body"], width=34)
+        self.cb_m_input.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        def _ustaw_malzonka():
+            val = self.cb_m_input.get().strip()
+            if not val:
+                return
+            self.lb_malzonek.delete(0, "end")
+            self.lb_malzonek.insert("end", val)
+            self.cb_m_input.set("")
+
+        def _usun_malzonka():
+            self.lb_malzonek.delete(0, "end")
+
+        tk.Button(m_top, text="Ustaw", command=_ustaw_malzonka,
+                  bg=GOLD_LT, fg=TEXT, font=self.f["small"], relief="flat",
+                  padx=8, pady=3, cursor="hand2").pack(side="left")
+        tk.Button(m_top, text="Wyczyść", command=_usun_malzonka,
+                  bg="#e0e0e0", fg=TEXT, font=self.f["small"], relief="flat",
+                  padx=6, pady=3, cursor="hand2").pack(side="left", padx=(4, 0))
+
+        m_bot = tk.Frame(m_frame, bg=PANEL)
+        m_bot.pack(fill="x")
+        self.lb_malzonek = tk.Listbox(m_bot, font=self.f["body"], bg=CREAM, fg=TEXT,
+                                      relief="flat", highlightthickness=1,
+                                      highlightbackground=BORDER, height=1,
+                                      exportselection=False, selectmode="single")
+        m_vsb = ttk.Scrollbar(m_bot, orient="vertical", command=self.lb_malzonek.yview)
+        self.lb_malzonek.configure(yscrollcommand=m_vsb.set)
+        m_vsb.pack(side="right", fill="y")
+        self.lb_malzonek.pack(side="left", fill="both", expand=True)
 
         # ── Dokumenty urzędowe (row 17–21) ───────────────────────────────────
         self._sep(f, 17, "Dokumenty urzędowe")
@@ -1254,11 +1731,62 @@ class DialogOsoby(tk.Toplevel):
         )
 
         self.v_odrz = tk.BooleanVar()
-        tk.Checkbutton(f,
+        self.cb_odrz = tk.Checkbutton(f,
             text="Odrzucenie spadku (art. 1020 KC) — zstępni wchodzą w miejsce",
             variable=self.v_odrz,
+            command=self._toggle_odrzucenie,
             bg=PANEL, font=self.f["body"]
-        ).grid(row=25, column=0, columnspan=3, sticky="w", padx=4, pady=2)
+        )
+        self.cb_odrz.grid(row=25, column=0, columnspan=3, sticky="w", padx=4, pady=2)
+
+        # ── Podstawa odrzucenia (widoczna tylko gdy odrzucono) ────────────────
+        self._odrz_frame = tk.Frame(f, bg="#f0eeff", bd=1, relief="groove")
+        self._odrz_frame.grid(row=26, column=0, columnspan=3, sticky="ew", padx=12, pady=(0, 4))
+        self._odrz_frame.grid_remove()  # ukryty domyślnie
+
+        tk.Label(self._odrz_frame, text="Odrzucono spadek na podstawie:",
+                 font=self.f["bold"], bg="#f0eeff", fg=TEXT
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 2))
+
+        self.v_podstawa = tk.StringVar(value="")
+        _PODSTAWY = [
+            ("akta_n",             "Akta N"),
+            ("oswiadczenie_sadowe", "Oświadczenie w toku postępowania sądowego"),
+            ("akt_notarialny",      "Akt notarialny w aktach"),
+            ("inne_akta",           "Inne akta"),
+        ]
+        self._odrz_txt_akta_n   = None
+        self._odrz_txt_inne     = None
+
+        for i, (val, label) in enumerate(_PODSTAWY):
+            rb = tk.Radiobutton(self._odrz_frame, text=label, variable=self.v_podstawa,
+                                value=val, bg="#f0eeff", font=self.f["body"],
+                                command=self._toggle_podstawa_txt)
+            rb.grid(row=i+1, column=0, sticky="w", padx=20, pady=1)
+
+        # Textbox dla "Akta N"
+        lbl_an = tk.Label(self._odrz_frame, text="Sygnatura / opis (Akta N):",
+                          font=self.f["small"], bg="#f0eeff", fg=MUTED)
+        lbl_an.grid(row=1, column=1, sticky="w", padx=(4, 4))
+        self._odrz_txt_akta_n = tk.Entry(self._odrz_frame, font=self.f["body"],
+                                          bg=CREAM, fg=TEXT, relief="flat",
+                                          highlightthickness=1, highlightbackground=BORDER,
+                                          width=28, state="disabled",
+                                          disabledbackground="#e0e0e0")
+        self._odrz_txt_akta_n.grid(row=2, column=1, sticky="ew", padx=(4, 8), pady=(0, 2))
+
+        # Textbox dla "Inne akta"
+        lbl_in = tk.Label(self._odrz_frame, text="Sygnatura / opis (Inne akta):",
+                          font=self.f["small"], bg="#f0eeff", fg=MUTED)
+        lbl_in.grid(row=4, column=1, sticky="w", padx=(4, 4))
+        self._odrz_txt_inne = tk.Entry(self._odrz_frame, font=self.f["body"],
+                                        bg=CREAM, fg=TEXT, relief="flat",
+                                        highlightthickness=1, highlightbackground=BORDER,
+                                        width=28, state="disabled",
+                                        disabledbackground="#e0e0e0")
+        self._odrz_txt_inne.grid(row=5, column=1, sticky="ew", padx=(4, 8), pady=(0, 6))
+
+        self._odrz_frame.columnconfigure(1, weight=1)
 
         self.v_wydz = tk.BooleanVar()
         tk.Label(f,
@@ -1266,20 +1794,20 @@ class DialogOsoby(tk.Toplevel):
                  "    nie ma wpływu na dziedziczenie ustawowe. Odnotuj dla celów informacyjnych.",
             font=self.f["small"], bg="#fffbe6", fg="#7a5c00",
             justify="left", padx=6, pady=4
-        ).grid(row=26, column=0, columnspan=3, sticky="ew", padx=4)
+        ).grid(row=27, column=0, columnspan=3, sticky="ew", padx=4)
 
         tk.Checkbutton(f,
             text="Wydziedziczona/y (art. 1008 KC — tylko zachowek)",
             variable=self.v_wydz,
             bg=PANEL, font=self.f["body"]
-        ).grid(row=27, column=0, columnspan=3, sticky="w", padx=4, pady=2)
+        ).grid(row=28, column=0, columnspan=3, sticky="w", padx=4, pady=2)
 
-        # ── Notatki (row 28–29) ───────────────────────────────────────────────
-        self._sep(f, 28, "Notatki")
+        # ── Notatki (row 29–30) ───────────────────────────────────────────────
+        self._sep(f, 29, "Notatki")
         self.e_notatki = tk.Text(f, height=3, font=self.f["body"],
                                   bg=CREAM, fg=TEXT, relief="flat",
                                   highlightthickness=1, highlightbackground=BORDER)
-        self.e_notatki.grid(row=29, column=0, columnspan=3, sticky="ew", padx=4, pady=(4, 8))
+        self.e_notatki.grid(row=30, column=0, columnspan=3, sticky="ew", padx=4, pady=(4, 8))
 
         bf = tk.Frame(self, bg=CREAM)
         bf.pack(fill="x", padx=16, pady=10)
@@ -1303,6 +1831,37 @@ class DialogOsoby(tk.Toplevel):
         else:
             self.cb_zrzeczenie_zstepnych.config(state="disabled")
 
+    def _toggle_odrzucenie(self, *_):
+        """Pokazuje/ukrywa sekcję podstawy odrzucenia i odblokuje checkboxy dokumentów."""
+        if self.v_odrz.get():
+            self._odrz_frame.grid()
+        else:
+            self._odrz_frame.grid_remove()
+            self.v_podstawa.set("")
+            # Wyczyść textboxy
+            if self._odrz_txt_akta_n:
+                self._odrz_txt_akta_n.config(state="normal")
+                self._odrz_txt_akta_n.delete(0, "end")
+                self._odrz_txt_akta_n.config(state="disabled")
+            if self._odrz_txt_inne:
+                self._odrz_txt_inne.config(state="normal")
+                self._odrz_txt_inne.delete(0, "end")
+                self._odrz_txt_inne.config(state="disabled")
+
+    def _toggle_podstawa_txt(self, *_):
+        """Włącza/wyłącza textboxy w zależności od wybranej podstawy."""
+        val = self.v_podstawa.get()
+        if self._odrz_txt_akta_n:
+            if val == "akta_n":
+                self._odrz_txt_akta_n.config(state="normal", disabledbackground="#e0e0e0")
+            else:
+                self._odrz_txt_akta_n.config(state="disabled")
+        if self._odrz_txt_inne:
+            if val == "inne_akta":
+                self._odrz_txt_inne.config(state="normal", disabledbackground="#e0e0e0")
+            else:
+                self._odrz_txt_inne.config(state="disabled")
+
     def _fill(self, o: Osoba):
         self.e_imie.insert(0, o.imie)
         self.e_nazwisko.insert(0, o.nazwisko)
@@ -1319,6 +1878,18 @@ class DialogOsoby(tk.Toplevel):
         self.v_zrzekla.set(o.zrzekla_sie)
         self.v_zrzeczenie_zstepnych.set(o.zrzeczenie_obejmuje_zstepnych)
         self._toggle_zrzeczenie()
+        self.v_odrz.set(o.odrzucila_spadek)
+        if o.odrzucila_spadek:
+            self._toggle_odrzucenie()
+            self.v_podstawa.set(o.podstawa_odrzucenia)
+            self._toggle_podstawa_txt()
+            tekst = o.podstawa_odrzucenia_tekst or ""
+            if o.podstawa_odrzucenia == "akta_n" and self._odrz_txt_akta_n:
+                self._odrz_txt_akta_n.config(state="normal")
+                self._odrz_txt_akta_n.insert(0, tekst)
+            elif o.podstawa_odrzucenia == "inne_akta" and self._odrz_txt_inne:
+                self._odrz_txt_inne.config(state="normal")
+                self._odrz_txt_inne.insert(0, tekst)
 
         def find_c(rid):
             for c in self._choices():
@@ -1326,25 +1897,29 @@ class DialogOsoby(tk.Toplevel):
                     return c
             return ""
 
-        if len(o.rodzic_ids) >= 1:
-            self.cb_r1.set(find_c(o.rodzic_ids[0]))
-        if len(o.rodzic_ids) >= 2:
-            self.cb_r2.set(find_c(o.rodzic_ids[1]))
+        for rid in o.rodzic_ids[:2]:
+            c = find_c(rid)
+            if c:
+                self.lb_rodzice.insert("end", c)
+
         if o.malzonek_id:
-            self.cb_m.set(find_c(o.malzonek_id))
+            c = find_c(o.malzonek_id)
+            if c:
+                self.lb_malzonek.insert("end", c)
 
         # Rodzeństwo — deduplikacja przez set (osoba z 2 wspólnych rodziców != 2x)
         if o.rodzic_ids:
             juz_dodane = set()
             for pid in o.rodzic_ids:
                 for dziecko in self.baza.dzieci(pid):
-                    if dziecko.id != o.id and dziecko.pelne_imie not in juz_dodane:
-                        juz_dodane.add(dziecko.pelne_imie)
-                        self.lb_rodz.insert("end", dziecko.pelne_imie)
+                    identifier = f"{dziecko.pelne_imie} [{dziecko.id}]"
+                    if dziecko.id != o.id and identifier not in juz_dodane:
+                        juz_dodane.add(identifier)
+                        self.lb_rodz.insert("end", identifier)
 
         # Dzieci
         for dziecko in self.baza.dzieci(o.id):
-            self.lb_dzieci.insert("end", dziecko.pelne_imie)
+            self.lb_dzieci.insert("end", f"{dziecko.pelne_imie} [{dziecko.id}]")
 
     def _norm_date(self, raw):
         raw = raw.strip()
@@ -1370,16 +1945,37 @@ class DialogOsoby(tk.Toplevel):
         if data_sm is None:
             return
 
-        r1 = self._resolve(self.cb_r1.get())
-        r2 = self._resolve(self.cb_r2.get())
         rodzic_ids = []
-        if r1:
-            rodzic_ids.append(r1)
-        if r2 and r2 != r1:
-            rodzic_ids.append(r2)
-        malzonek_id = self._resolve(self.cb_m.get()) or None
+        for rval in self.lb_rodzice.get(0, "end"):
+            rid = self._resolve(rval.strip())
+            if rid and rid not in rodzic_ids:
+                rodzic_ids.append(rid)
+        malzonek_id = None
+        if self.lb_malzonek.size() > 0:
+            malzonek_id = self._resolve(self.lb_malzonek.get(0).strip()) or None
+
+        # ── Walidacja prawna: zakaz niedozwolonych związków (KRiO art. 14 §1) ─
+        if malzonek_id:
+            osoba_id_do_spr = self.osoba.id if self.osoba else None
+            blad_zwiazku = self.baza.sprawdz_niedozwolony_zwiazek(
+                osoba_id_do_spr, malzonek_id,
+                extra_rodzice_osoby=rodzic_ids if not self.osoba else None
+            )
+            if blad_zwiazku:
+                messagebox.showerror("Niedozwolony związek", blad_zwiazku, parent=self)
+                return
 
         notatki = self.e_notatki.get("1.0", "end").strip()
+
+        # Odczytaj podstawę odrzucenia i tekst uzupełniający
+        podstawa = self.v_podstawa.get() if self.v_odrz.get() else ""
+        if podstawa == "akta_n" and self._odrz_txt_akta_n:
+            podstawa_tekst = self._odrz_txt_akta_n.get().strip()
+        elif podstawa == "inne_akta" and self._odrz_txt_inne:
+            podstawa_tekst = self._odrz_txt_inne.get().strip()
+        else:
+            podstawa_tekst = ""
+
         if self.osoba:
             o = self.osoba
             o.imie, o.nazwisko = imie, nazwisko
@@ -1395,6 +1991,8 @@ class DialogOsoby(tk.Toplevel):
             o.akt_smierci = self.v_akt_sm.get()
             o.zrzekla_sie = self.v_zrzekla.get()
             o.zrzeczenie_obejmuje_zstepnych = self.v_zrzeczenie_zstepnych.get()
+            o.podstawa_odrzucenia = podstawa
+            o.podstawa_odrzucenia_tekst = podstawa_tekst
             self.result = o
         else:
             self.result = Osoba(
@@ -1410,6 +2008,8 @@ class DialogOsoby(tk.Toplevel):
                 akt_smierci=self.v_akt_sm.get(),
                 zrzekla_sie=self.v_zrzekla.get(),
                 zrzeczenie_obejmuje_zstepnych=self.v_zrzeczenie_zstepnych.get(),
+                podstawa_odrzucenia=podstawa,
+                podstawa_odrzucenia_tekst=podstawa_tekst,
             )
             self.baza.dodaj(self.result)
 
@@ -1436,43 +2036,35 @@ class DialogOsoby(tk.Toplevel):
             # (relacja rodzic→dziecko wynika z dziecko.rodzic_ids, nie ma osobnego pola)
 
         # ── Sprzężenie rodzeństwa ─────────────────────────────────────────────
-        # Zbierz nazwy z listboxa i zmapuj na obiekty Osoba (lub auto-utwórz)
+        # Zbierz wpisy z listboxa i zmapuj na obiekty Osoba przez _resolve
         nazwy_w_liscie = list(self.lb_rodz.get(0, "end"))
         for nazwa in nazwy_w_liscie:
             nazwa = nazwa.strip()
             if not nazwa:
                 continue
-            # Znajdź istniejącą osobę po pelne_imie lub utwórz nową
-            rodz_obj = next(
-                (o for o in self.baza.osoby.values() if o.pelne_imie == nazwa),
-                None)
-            if rodz_obj is None:
-                # Auto-utwórz z wpisanego imienia i nazwiska
-                czesci = nazwa.split(None, 1)
-                rodz_obj = Osoba(
-                    imie=czesci[0],
-                    nazwisko=(czesci[1] if len(czesci) > 1 else "?"))
-                self.baza.dodaj(rodz_obj)
+            rodz_id = self._resolve(nazwa)
+            rodz_obj = self.baza.osoby.get(rodz_id) if rodz_id else None
+            if not rodz_obj:
+                continue
 
-            # Nadaj wspólnych rodziców (sprzężenie)
-            for pid in ja.rodzic_ids:
+            # Sprzężenie obustronne: unia rodziców obu osób
+            for pid in list(ja.rodzic_ids):
                 if pid not in rodz_obj.rodzic_ids:
                     rodz_obj.rodzic_ids.append(pid)
+            for pid in list(rodz_obj.rodzic_ids):
+                if pid not in ja.rodzic_ids:
+                    ja.rodzic_ids.append(pid)
 
         # ── Sprzężenie dzieci ─────────────────────────────────────────────
         for nazwa in self.lb_dzieci.get(0, "end"):
             nazwa = nazwa.strip()
             if not nazwa:
                 continue
-            dz_obj = next(
-                (o for o in self.baza.osoby.values() if o.pelne_imie == nazwa), None)
-            if dz_obj is None:
-                czesci = nazwa.split(None, 1)
-                dz_obj = Osoba(imie=czesci[0],
-                               nazwisko=(czesci[1] if len(czesci) > 1 else "?"))
-                self.baza.dodaj(dz_obj)
+            dz_id = self._resolve(nazwa)
+            dz_obj = self.baza.osoby.get(dz_id) if dz_id else None
+            if not dz_obj:
+                continue
             if ja.id not in dz_obj.rodzic_ids:
                 dz_obj.rodzic_ids.append(ja.id)
 
         self.destroy()
-

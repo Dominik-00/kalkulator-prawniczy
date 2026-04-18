@@ -31,10 +31,6 @@ def _ukryj_pliki_pomocnicze():
 
 _ukryj_pliki_pomocnicze()
 
-import sys
-import os
-
-
 def _pokaz_blad(tytul, tresc):
     """Wyswietla okno bledu przez tkinter nawet jesli reszta aplikacji nie dziala."""
     try:
@@ -54,7 +50,6 @@ def _ensure_deps():
         from dateutil.relativedelta import relativedelta  # noqa: F401
     except ImportError:
         try:
-            import subprocess
             subprocess.check_call(
                 [sys.executable, "-m", "pip", "install", "python-dateutil", "--quiet"],
                 timeout=60

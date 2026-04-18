@@ -20,6 +20,7 @@ HEADER_H = 58
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def fmt(n: float) -> str:
     """Formatuje liczbę jako polską kwotę PLN."""
+    n = n + 0.0  # normalizuje -0.0 → 0.0
     return f"{n:,.2f} PLN".replace(",", " ").replace(".", ",")
 
 def safe_float(widget, default=0.0) -> float:
@@ -35,28 +36,26 @@ def safe_int(widget, default=0) -> int:
         return default
 
 # ── Stawki opłat sądowych (UKSCP art. 13) ────────────────────────────────────
+_OPLATA_PROGI = (
+    (500, 30), (1500, 100), (4000, 200), (7500, 400),
+    (10000, 500), (15000, 750), (20000, 1000),
+)
+
 def oplata_sadowa(wps: float, rodzaj: str, instancja: str) -> float:
+    rodzaj = (rodzaj or "").lower()
     if rodzaj == "pracownicza":
         return 0.0
-    if wps <= 500:       o = 30
-    elif wps <= 1500:    o = 100
-    elif wps <= 4000:    o = 200
-    elif wps <= 7500:    o = 400
-    elif wps <= 10000:   o = 500
-    elif wps <= 15000:   o = 750
-    elif wps <= 20000:   o = 1000
-    else:                o = min(wps * 0.05, 200000)
-    if rodzaj == "upominawcze":
-        o = o / 4
+
+    o = next((k for p, k in _OPLATA_PROGI if wps <= p), min(wps * 0.05, 100000))
+    if rodzaj in {"nakazowe", "epu", "upominawcze"}:
+        o /= 4
     return math.ceil(o)
 
 # §2 rozp. MS z 22.10.2015 – minimalne wynagrodzenie pełnomocnika
+_STAWKI_PELNOM = (
+    (500, 90), (1500, 270), (5000, 900), (10000, 1800),
+    (50000, 3600), (200000, 5400), (2000000, 10800), (5000000, 15000),
+)
+
 def wynagrodzenie_pelnomocnika(wps: float) -> float:
-    if wps <= 500:        return 90
-    if wps <= 1500:       return 270
-    if wps <= 5000:       return 900
-    if wps <= 10000:      return 1800
-    if wps <= 50000:      return 3600
-    if wps <= 200000:     return 5400
-    if wps <= 2000000:    return 10800
-    return 15000
+    return next((k for p, k in _STAWKI_PELNOM if wps <= p), 25000)
